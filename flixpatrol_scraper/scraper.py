@@ -357,7 +357,7 @@ class FlixPatrolScraper:
             self._fetch_title_response,
             self._parse_title_details,
             start_interval_seconds=self._rate_limiter.interval_seconds,
-            max_pause_seconds=timeout_seconds,
+            max_pause_seconds=180.0,
         )
         self._credentials_generation = 0
         if not 1 <= max_titles_per_chart <= TOP10_LIMIT:
@@ -646,7 +646,7 @@ class FlixPatrolScraper:
         title_details_deferred = False
         if self.tmdb_resolver is not None:
             charts, title_details_deferred = self._enrich_charts_with_tmdb(
-                charts, fetch_title_details=fetch_title_details
+                charts, fetch_title_details=fetch_title_details, region=page_region
             )
             for chart in charts:
                 repeats = chart.repeated_title_ranks
@@ -854,18 +854,19 @@ class FlixPatrolScraper:
                     f"Chart {heading!r} has an invalid source rank {rank_text!r}"
                 )
             rank = int(rank_match[1])
-            title_links = []
-            if len(cells) >= 3:
-                for link in cells[2].find_all("a", href=True):
-                    if link.find_parent("tr") is not row:
-                        continue
-                    source_link = _title_link_path(link["href"])
-                    title = _visible_text(link)
-                    if source_link and title:
-                        title_links.append((source_link, title))
+            title_links_by_path: dict[str, str] = {}
+            for link in row.find_all("a", href=True):
+                if link.find_parent("tr") is not row or _is_hidden(link):
+                    continue
+                source_link = _title_link_path(link["href"])
+                title = _visible_text(link)
+                if source_link and title:
+                    title_links_by_path.setdefault(source_link, title)
+            title_links = list(title_links_by_path.items())
             if len(title_links) != 1:
                 raise ScraperError(
-                    f"Chart {heading!r} rank {rank} needs exactly one visible title link"
+                    f"Chart {heading!r} rank {rank} needs exactly one visible title link; "
+                    f"found {len(title_links)} across {len(cells)} cells"
                 )
             source_link, title = title_links[0]
             providers = {
@@ -1022,17 +1023,32 @@ class FlixPatrolScraper:
         return media_type, f"{premiere.year:04d}"
 
     def _enrich_charts_with_tmdb(
-        self, charts: list[Chart], *, fetch_title_details: bool = False
+        self,
+        charts: list[Chart],
+        *,
+        fetch_title_details: bool = False,
+        region: str | None = None,
     ) -> tuple[list[Chart], bool]:
-        work_items: dict[tuple[str, str, str | None, str | None, bool], list[tuple[int, int]]] = {}
+        WorkKey = tuple[str, str, str | None, str | None, str, str | None, str, bool]
+        work_items: dict[WorkKey, list[tuple[int, int]]] = {}
         for chart_index, chart in enumerate(charts):
             media_hint = self._chart_media_type(chart.category)
             overall = chart.category.casefold() == "overall"
+            chart_date = parse_chart_date(chart.date).isoformat()
             repeats = chart.repeated_title_ranks
             for entry_index, entry in enumerate(chart.entries):
                 if entry.rank in repeats:
                     entry = chart.entries[repeats[entry.rank] - 1]
-                work_key = (entry.source_link, entry.title, media_hint, entry.original_provider, overall)
+                work_key = (
+                    entry.source_link,
+                    entry.title,
+                    media_hint,
+                    entry.original_provider,
+                    chart.platform,
+                    region,
+                    chart_date,
+                    overall,
+                )
                 work_items.setdefault(work_key, []).append((chart_index, entry_index))
 
         resolver = self.tmdb_resolver
@@ -1042,9 +1058,23 @@ class FlixPatrolScraper:
             and getattr(resolve, "__func__", None) is TMDBResolver.resolve
         )
 
-        def match_hints(work_key: tuple[str, str, str | None, str | None, bool]) -> dict[str, Any]:
-            source_link, title, media_hint, original_provider, _ = work_key
-            hints = {"media_hint": media_hint}
+        def match_hints(work_key: WorkKey) -> dict[str, Any]:
+            (
+                source_link,
+                title,
+                media_hint,
+                original_provider,
+                platform,
+                region,
+                chart_date,
+                _,
+            ) = work_key
+            hints = {
+                "media_hint": media_hint,
+                "streaming_platform": platform,
+                "region": region,
+                "chart_date": chart_date,
+            }
             if original_provider is not None:
                 hints["original_provider"] = original_provider
             year_match = re.fullmatch(r"/title/(.+)-([12][0-9]{3})", source_link)
@@ -1059,7 +1089,7 @@ class FlixPatrolScraper:
 
         def typed_fallbacks(matches) -> dict[str, TMDBMatch]:
             typed_matches: dict[str, dict[tuple[str, int], TMDBMatch]] = {}
-            for (source_link, _, media_hint, _, _), match in matches.items():
+            for (source_link, _, media_hint, _, _, _, _, _), match in matches.items():
                 if source_link and isinstance(match, TMDBMatch) and match.media_type == media_hint:
                     typed_matches.setdefault(source_link, {})[(match.media_type, match.id)] = match
             return {
@@ -1069,7 +1099,6 @@ class FlixPatrolScraper:
             }
 
         resolved_matches: dict[tuple[int, int], TMDBMatch | None] = {}
-        details_deferred = threading.Event()
         max_workers = min(self.tmdb_max_workers, len(work_items))
         pool = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else nullcontext()
         with pool as executor:
@@ -1079,29 +1108,14 @@ class FlixPatrolScraper:
 
             matches = run(lookup, work_items)
             overall_fallbacks = typed_fallbacks(matches)
-            detail_jobs = self._title_detail_pool.submit(
-                link for (link, _, _, _, overall), match in matches.items()
-                if fetch_title_details and native_resolver and link and isinstance(match, tuple)
-                and not (overall and link in overall_fallbacks)
-            )
-
             def complete(work_key):
-                link, title, _, _, overall = work_key
+                link, title, _, _, _, _, _, overall = work_key
                 match = matches[work_key]
                 fallback = overall_fallbacks.get(link) if overall else None
                 if not native_resolver:
                     return match or fallback
-                detail = detail_jobs.get(link)
-
-                def get_details():
-                    result = detail.result()
-                    if self._title_detail_pool.was_deferred(link):
-                        details_deferred.set()
-                    return result
-
                 return resolver.complete_match(
                     title, match, **match_hints(work_key), fallback=fallback,
-                    title_details=get_details if detail is not None else None,
                 )
 
             typed = [key for key in work_items if key[2] is not None]
@@ -1120,7 +1134,7 @@ class FlixPatrolScraper:
             ]
             enriched_charts.append(replace(chart, entries=enriched_entries))
 
-        return enriched_charts, details_deferred.is_set()
+        return enriched_charts, False
 
     @staticmethod
     def _chart_media_type(category: str) -> str | None:

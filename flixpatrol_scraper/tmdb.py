@@ -33,7 +33,12 @@ class _AmbiguousMatchError(TMDBResolverError):
     def __init__(self, matches: tuple[TMDBMatch, ...]) -> None:
         self.matches = matches
         super().__init__(
-            ", ".join(f"{match.media_type}:{match.id} ({match.release_date})" for match in matches)
+            ", ".join(
+                f"{match.media_type}:{match.id} {match.matched_title!r} ({match.release_date}, "
+                f"title-score={match.title_match_score:.2f}, "
+                f"popularity={match.popularity:.2f}, votes={match.vote_count})"
+                for match in sorted(matches, key=lambda item: item.popularity, reverse=True)
+            )
         )
 
 
@@ -52,6 +57,11 @@ class TMDBMatch:
     original_title: str | None
     release_date: str | None
     search_endpoint: str
+    popularity: float = 0.0
+    vote_count: int = 0
+    title_match_score: float = 1.0
+    vote_average: float = 0.0
+    original_language: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,15 +97,17 @@ class TMDBResolver:
         self._shared_session = session
         self._thread_local = threading.local()
         self._search_cache: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
-        self._match_cache: dict[tuple[str, str | None, str | None, str], _MatchResult] = {}
+        self._match_cache: dict[tuple[Any, ...], _MatchResult] = {}
         self._reported_unmatched: set[
-            tuple[str, str | None, str | None, str | None, _MatchResult, tuple[str, str] | None]
+            tuple[Any, ...]
         ] = set()
-        self._provider_cache: dict[tuple[str, int], frozenset[str]] = {}
+        self._provider_cache: dict[tuple[str, int, str], frozenset[str]] = {}
+        self._country_codes: dict[str, str] | None = None
+        self._country_codes_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._search_inflight: dict[tuple[str, str, str | None], _InFlightRequest] = {}
-        self._match_inflight: dict[tuple[str, str | None, str | None, str], _InFlightRequest] = {}
-        self._provider_inflight: dict[tuple[str, int], _InFlightRequest] = {}
+        self._match_inflight: dict[tuple[Any, ...], _InFlightRequest] = {}
+        self._provider_inflight: dict[tuple[str, int, str], _InFlightRequest] = {}
         self._rate_limiter = RateLimiter(
             max_requests_per_second=self.max_requests_per_second
         )
@@ -190,15 +202,26 @@ class TMDBResolver:
         media_hint: str | None = None,
         release_year: str | None = None,
         original_provider: str | None = None,
+        streaming_platform: str | None = None,
+        region: str | None = None,
+        chart_date: str | None = None,
         title_details: Callable[[], tuple[str, str] | None] | None = None,
         fallback: TMDBMatch | None = None,
     ) -> TMDBMatch | None:
         result = self.find_match(
-            title, media_hint=media_hint, release_year=release_year, original_provider=original_provider
+            title,
+            media_hint=media_hint,
+            release_year=release_year,
+            original_provider=original_provider,
+            streaming_platform=streaming_platform,
+            region=region,
+            chart_date=chart_date,
         )
         return self.complete_match(
             title, result, media_hint=media_hint, release_year=release_year,
-            original_provider=original_provider, title_details=title_details, fallback=fallback,
+            original_provider=original_provider, streaming_platform=streaming_platform,
+            region=region, chart_date=chart_date,
+            title_details=title_details, fallback=fallback,
         )
 
     def complete_match(
@@ -209,6 +232,9 @@ class TMDBResolver:
         media_hint: str | None = None,
         release_year: str | None = None,
         original_provider: str | None = None,
+        streaming_platform: str | None = None,
+        region: str | None = None,
+        chart_date: str | None = None,
         title_details: Callable[[], tuple[str, str] | None] | None = None,
         fallback: TMDBMatch | None = None,
     ) -> TMDBMatch | None:
@@ -216,7 +242,10 @@ class TMDBResolver:
             return result
         if fallback is not None:
             return fallback
-        details = title_details() if result is not None and title_details is not None else None
+        # A missing match can be caused by FlixPatrol's displayed title differing
+        # from TMDB's title. Use the source page's type/year as a second search hint
+        # for both ambiguous and completely unmatched titles.
+        details = title_details() if title_details is not None else None
         if details is not None:
             detail_media, detail_year = details
             if detail_media in {"movie", "tv"} and media_hint in {None, detail_media}:
@@ -226,29 +255,38 @@ class TMDBResolver:
                         normalize_title(title),
                         self._search(endpoint, title, release_year=detail_year),
                         endpoint=endpoint,
-                        media_hint=detail_media,
-                        release_year=detail_year,
                     )
                 except (TMDBResolverError, ValueError, TypeError, KeyError, AttributeError) as exc:
                     logger.debug("Could not resolve TMDB match for %r with title details: %s", title, exc)
                 else:
-                    if match is not None:
+                    if match is not None and match.title_match_score >= 0.90:
                         return match
 
-        warning_key = (title, media_hint, release_year, original_provider, result, details)
+        warning_key = (
+            title, media_hint, release_year, original_provider,
+            streaming_platform, region, chart_date, result, details,
+        )
         with self._cache_lock:
             if warning_key in self._reported_unmatched:
                 return None
             self._reported_unmatched.add(warning_key)
+        context = (
+            f"media={media_hint or 'any'}, year={release_year or 'any'}, "
+            f"platform={streaming_platform or original_provider or 'unknown'}, "
+            f"region={region or 'unknown'}, chart_date={chart_date or 'unknown'}"
+        )
         if result is None:
             logger.warning(
-                "No verified TMDB match for %r (%s, %s)",
-                title, media_hint, release_year,
+                "Leaving TMDB null for %r (%s): no qualifying TMDB candidates",
+                title,
+                context,
             )
             return None
         logger.warning(
-            "Ambiguous TMDB match for %r (%s): %s",
-            title, media_hint, _AmbiguousMatchError(result),
+            "Leaving TMDB null for %r (%s): unresolved candidates: %s",
+            title,
+            context,
+            _AmbiguousMatchError(result),
         )
         return None
 
@@ -259,9 +297,15 @@ class TMDBResolver:
         media_hint: str | None = None,
         release_year: str | None = None,
         original_provider: str | None = None,
+        streaming_platform: str | None = None,
+        region: str | None = None,
+        chart_date: str | None = None,
     ) -> _MatchResult:
         provider = normalize_title(original_provider or "")
-        cache_key = (title, media_hint, release_year, provider)
+        platform = _normalize_provider(streaming_platform or "")
+        country = normalize_title(region or "")
+        endpoint_order = self._build_search_order(media_hint)
+        cache_key = (title, media_hint, release_year, provider, platform, country, chart_date)
         with self._cache_lock:
             if cache_key in self._match_cache:
                 return self._match_cache[cache_key]
@@ -288,45 +332,40 @@ class TMDBResolver:
             return cached_match
 
         try:
-            endpoint_order = self._build_search_order(media_hint)
-            normalized_search_title = normalize_title(title)
-
             candidates: list[TMDBMatch] = []
-            for endpoint in endpoint_order:
-                if release_year is not None and endpoint != "/search/multi":
-                    results = self._search(endpoint, title, release_year=release_year)
-                else:
-                    results = self._search(endpoint, title)
-                try:
-                    candidate = self._pick_best_match(
-                        normalized_search_title,
-                        results,
-                        endpoint=endpoint,
-                        media_hint=media_hint,
-                        release_year=release_year,
-                    )
-                except _AmbiguousMatchError as exc:
-                    candidates.extend(exc.matches)
-                else:
-                    if candidate is not None:
-                        candidates.append(candidate)
-                if candidates and (media_hint or endpoint == "/search/multi"):
-                    break
-
-            cacheable = True
-            match: _MatchResult = next(iter(candidates), None)
-            if len(candidates) > 1:
-                match = tuple(candidates)
-                if provider:
+            for search_title in _title_search_variants(title):
+                normalized_search_title = normalize_title(search_title)
+                for endpoint in endpoint_order:
+                    results = self._search(endpoint, search_title)
                     try:
-                        match = self._pick_provider_match(match, provider, title) or match
-                    except (TMDBResolverError, KeyError, TypeError, ValueError, AttributeError) as exc:
-                        logger.debug("Could not verify the TMDB provider for %r: %s", title, exc)
-                        cacheable = False
+                        candidate = self._pick_best_match(
+                            normalized_search_title,
+                            results,
+                            endpoint=endpoint,
+                        )
+                    except _AmbiguousMatchError as exc:
+                        candidates.extend(exc.matches)
+                    else:
+                        if candidate is not None:
+                            candidates.append(candidate)
+                    # Search every applicable endpoint; ordering is not match evidence.
 
-            if cacheable:
-                with self._cache_lock:
-                    self._match_cache[cache_key] = match
+            unique_candidates: dict[tuple[str, int], TMDBMatch] = {}
+            for candidate in candidates:
+                identity = (candidate.media_type, candidate.id)
+                current = unique_candidates.get(identity)
+                if current is None or candidate.title_match_score > current.title_match_score:
+                    unique_candidates[identity] = candidate
+            candidates = list(unique_candidates.values())
+
+            typed_candidates = [
+                candidate for candidate in candidates if candidate.media_type == media_hint
+            ]
+            if typed_candidates:
+                candidates = typed_candidates
+            match = self._pick_ranked_match(tuple(candidates))
+            with self._cache_lock:
+                self._match_cache[cache_key] = match
             self._complete_inflight(
                 self._match_inflight,
                 cache_key,
@@ -425,18 +464,95 @@ class TMDBResolver:
         return response.json()
 
     def _pick_provider_match(
-        self, matches: tuple[TMDBMatch, ...], provider: str, title: str
+        self,
+        matches: tuple[TMDBMatch, ...],
+        providers: tuple[str | None, str | None],
+        region: str | None,
+        title: str,
     ) -> TMDBMatch | None:
-        candidate = None
-        for match in matches:
-            if provider in self._subscription_providers(match, title):
-                if candidate is not None:
-                    return None
-                candidate = match
-        return candidate
+        country_code = self._country_code(region, title)
+        if country_code is None:
+            return None
+        for provider in providers:
+            expected = _normalize_provider(provider or "")
+            if not expected:
+                continue
+            candidates = [
+                match
+                for match in matches
+                if match.title_match_score >= 0.90
+                if expected in self._subscription_providers(match, country_code, title)
+            ]
+            logger.debug(
+                "TMDB availability check for %r: %s matches %d/%d candidates in %s",
+                title,
+                provider,
+                len(candidates),
+                len(matches),
+                region,
+            )
+            if len(candidates) == 1:
+                logger.debug(
+                    "Selected TMDB %s:%s for %r because it is available on %s in %s "
+                    "(title=%r, release=%s, title-score=%.2f, popularity=%.2f, votes=%d)",
+                    candidates[0].media_type,
+                    candidates[0].id,
+                    title,
+                    provider,
+                    region,
+                    candidates[0].matched_title,
+                    candidates[0].release_date,
+                    candidates[0].title_match_score,
+                    candidates[0].popularity,
+                    candidates[0].vote_count,
+                )
+                return candidates[0]
+        return None
 
-    def _subscription_providers(self, match: TMDBMatch, title: str) -> frozenset[str]:
-        cache_key = (match.media_type, match.id)
+    @staticmethod
+    def _pick_ranked_match(matches: tuple[TMDBMatch, ...]) -> TMDBMatch | None:
+        """Choose the most popular candidate among safe fuzzy title matches."""
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda match: (
+                match.popularity,
+                match.title_match_score,
+                match.vote_count,
+            ),
+        )
+
+    def _country_code(self, region: str | None, title: str) -> str | None:
+        normalized_region = normalize_title(region or "")
+        if not normalized_region or normalized_region in {"global", "the world"}:
+            return None
+        with self._country_codes_lock:
+            if self._country_codes is None:
+                countries = self._request_json("/configuration/countries", title, {})
+                self._country_codes = {
+                    normalize_title(str(name)): str(country["iso_3166_1"])
+                    for country in countries
+                    if isinstance(country, dict)
+                    and country.get("iso_3166_1")
+                    for name in (country.get("english_name"), country.get("native_name"))
+                    if name
+                }
+            aliases = {
+                "united states": "united states of america",
+                "salvador": "el salvador",
+                "swaziland": "eswatini",
+            }
+            lookup_region = aliases.get(normalized_region, normalized_region)
+            country_code = self._country_codes.get(lookup_region)
+            if country_code is None:
+                logger.debug("TMDB provider lookup skipped: no country code for %r", region)
+            return country_code
+
+    def _subscription_providers(
+        self, match: TMDBMatch, country_code: str, title: str
+    ) -> frozenset[str]:
+        cache_key = (match.media_type, match.id, country_code)
         with self._cache_lock:
             if cache_key in self._provider_cache:
                 return self._provider_cache[cache_key]
@@ -457,10 +573,11 @@ class TMDBResolver:
             if providers is None:
                 endpoint = f"/{match.media_type}/{match.id}/watch/providers"
                 markets = self._request_json(endpoint, title, {})["results"]
+                market = markets.get(country_code, {})
                 providers = frozenset(
-                    normalize_title(offer["provider_name"])
-                    for market in markets.values()
+                    _normalize_provider(offer["provider_name"])
                     for offer in market.get("flatrate", [])
+                    if offer.get("provider_name")
                 )
                 with self._cache_lock:
                     self._provider_cache[cache_key] = providers
@@ -494,27 +611,31 @@ class TMDBResolver:
         results: list[dict[str, Any]],
         *,
         endpoint: str,
-        media_hint: str | None,
-        release_year: str | None = None,
     ) -> TMDBMatch | None:
         matches: dict[tuple[str, int], TMDBMatch] = {}
         for result in results:
             media_type = self._extract_media_type(result, endpoint)
-            if media_hint and media_type != media_hint:
-                continue
-            release_date = self._extract_result_release_date(result, media_type)
-            if release_year and (release_date or "")[:4] != release_year:
-                continue
-
             candidate_titles = [
                 self._extract_result_title(result, media_type),
                 self._extract_result_original_title(result, media_type),
             ]
-            if any(
-                title and normalize_title(title) == normalized_search_title
-                for title in candidate_titles
-            ):
-                match = self._build_match(result, endpoint=endpoint)
+            scores = [
+                (_title_similarity(normalized_search_title, normalize_title(candidate)), candidate)
+                for candidate in candidate_titles
+                if candidate
+            ]
+            safe_scores = [
+                score
+                for score, candidate in scores
+                if score >= 0.72
+                and _is_safe_fuzzy_title_match(
+                    normalized_search_title, normalize_title(candidate)
+                )
+            ]
+            if safe_scores:
+                match = self._build_match(
+                    result, endpoint=endpoint, title_match_score=max(safe_scores)
+                )
                 matches[(match.media_type, match.id)] = match
 
         if len(matches) > 1:
@@ -526,6 +647,7 @@ class TMDBResolver:
         result: dict[str, Any],
         *,
         endpoint: str,
+        title_match_score: float = 1.0,
     ) -> TMDBMatch:
         media_type = self._extract_media_type(result, endpoint)
         matched_title = self._extract_result_title(result, media_type)
@@ -539,6 +661,15 @@ class TMDBResolver:
             original_title=original_title,
             release_date=release_date,
             search_endpoint=endpoint,
+            popularity=float(result.get("popularity") or 0.0),
+            vote_count=int(result.get("vote_count") or 0),
+            title_match_score=title_match_score,
+            vote_average=float(result.get("vote_average") or 0.0),
+            original_language=(
+                str(result["original_language"])
+                if result.get("original_language")
+                else None
+            ),
         )
 
     @staticmethod
@@ -582,3 +713,76 @@ def normalize_title(value: str) -> str:
     stripped = stripped.replace("&", " and ")
     stripped = re.sub(r"[^\w\s]", " ", stripped)
     return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _normalize_provider(value: str) -> str:
+    provider = normalize_title(value)
+    aliases = {
+        "amazon prime": "amazon prime video",
+        "prime video": "amazon prime video",
+        "disney": "disney plus",
+        "apple tv": "apple tv plus",
+        "max": "hbo max",
+        "paramount": "paramount plus",
+    }
+    return aliases.get(provider, provider)
+
+
+def _title_search_variants(title: str) -> tuple[str, ...]:
+    normalized = normalize_title(title)
+    if re.fullmatch(r"\d{2,4}", normalized):
+        digit_words = (
+            "zero", "one", "two", "three", "four",
+            "five", "six", "seven", "eight", "nine",
+        )
+        spelled = " ".join(digit_words[int(digit)] for digit in normalized)
+        if spelled != normalized:
+            return title, spelled
+    return (title,)
+
+
+def _is_safe_fuzzy_title_match(query: str, candidate: str) -> bool:
+    if query == candidate:
+        return True
+    generic = {"a", "an", "the", "movie", "film", "tv", "show", "series"}
+    query_words = set(query.split()) - generic
+    candidate_words = set(candidate.split()) - generic
+    if not query_words or not candidate_words:
+        return False
+    # A title that merely extends or shortens another title is often a sequel,
+    # subtitle, or different work in the same franchise (e.g. Hunger Games: Ballad).
+    # Permit fuzzy spelling/order differences, but reject token containment.
+    return not (query_words < candidate_words or candidate_words < query_words)
+
+
+def _title_similarity(query: str, candidate: str) -> float:
+    """Score exact, shortened, and expanded titles without matching one shared word."""
+    if not query or not candidate:
+        return 0.0
+    if query == candidate:
+        return 1.0
+
+    stop_words = {"a", "an", "the", "movie", "film", "tv", "show", "series"}
+    query_words = query.split()
+    candidate_words = candidate.split()
+    query_tokens = set(query.split()) - stop_words
+    candidate_tokens = set(candidate.split()) - stop_words
+    query_tokens = query_tokens or set(query.split())
+    candidate_tokens = candidate_tokens or set(candidate.split())
+
+    if query_tokens <= candidate_tokens:
+        # Keep generic suffixes such as "the movie" as useful evidence. They
+        # should qualify a shortened title, while an exact title still ranks
+        # a little higher when candidates otherwise have similar evidence.
+        extra_tokens = len(candidate_words) - len(query_words)
+        return max(0.90, 0.97 - 0.025 * extra_tokens)
+    if candidate_tokens < query_tokens:
+        extra_tokens = len(query_tokens - candidate_tokens)
+        return max(0.72, 0.92 - 0.10 * extra_tokens)
+
+    overlap = len(query_tokens & candidate_tokens)
+    coverage = overlap / len(query_tokens)
+    if coverage >= 0.75:
+        precision = overlap / len(candidate_tokens)
+        return 0.72 + 0.20 * coverage * precision
+    return 0.0

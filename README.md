@@ -46,11 +46,9 @@ Resolve TMDB IDs while scraping:
 python -m flixpatrol_scraper --all-regions --output exports --resolve-tmdb --tmdb-api-key YOUR_TMDB_API_KEY
 ```
 
-Resolve ambiguous TMDB matches using FlixPatrol title details. At a request rate of `0.5`, chart requests are spaced two seconds apart. Up to five title detail requests can start in a rolling two-second window, with 0–500 ms of jitter between starts.
+Ambiguous TMDB matches are checked against TMDB's streaming-provider availability for the chart's platform and country. TMDB's watch-provider data is powered by JustWatch; attribute JustWatch when presenting that provider data.
 
-```bash
-python -m flixpatrol_scraper --region global --output global.json --resolve-tmdb --tmdb-api-key YOUR_TMDB_API_KEY --fetch-title-details --requests-per-second 0.5
-```
+Title matching accepts shortened or expanded names when the meaningful words align (for example, `Matchbox` and `Matchbox: The Movie`). The resolver uses the chart's platform and country, release date, TMDB popularity, and vote count to rank candidates. Popularity alone does not decide a match; ambiguous candidates stay unresolved unless the combined evidence has a clear lead. Title resolution uses TMDB only and does not fetch FlixPatrol title pages.
 
 ## GitHub Actions
 

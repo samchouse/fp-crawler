@@ -44,6 +44,7 @@ class TitleDetailPool:
         self._max_pause_seconds = max_pause_seconds
         self._condition = threading.Condition()
         self._results: dict[str, Future[TitleDetails]] = {}
+        self._deadlines: dict[str, float] = {}
         self._queue: list[tuple[float, int, str, int]] = []
         self._workers: list[threading.Thread] = []
         self._starts: deque[float] = deque()
@@ -63,6 +64,7 @@ class TitleDetailPool:
             for link in links:
                 if link not in self._results:
                     self._results[link] = Future()
+                    self._deadlines[link] = time.monotonic() + self._max_pause_seconds
                     if self._closed:
                         self._defer(link)
                     else:
@@ -89,9 +91,21 @@ class TitleDetailPool:
                     self._condition.wait()
                     continue
                 ready, _, link, attempt = self._queue[0]
-                delay = max(ready, self._next_start_time()) - time.monotonic()
+                now = time.monotonic()
+                deadline = self._deadlines[link]
+                if now >= deadline:
+                    heapq.heappop(self._queue)
+                    logger.warning(
+                        "Deferring FlixPatrol title details for %s: the %.0fs resolution "
+                        "budget expired before the next request started",
+                        link,
+                        self._max_pause_seconds,
+                    )
+                    self._defer(link)
+                    continue
+                delay = max(ready, self._next_start_time()) - now
                 if delay > 0:
-                    self._condition.wait(min(delay, threading.TIMEOUT_MAX))
+                    self._condition.wait(min(delay, deadline - now, threading.TIMEOUT_MAX))
                 else:
                     heapq.heappop(self._queue)
                     return link, attempt
@@ -113,24 +127,58 @@ class TitleDetailPool:
             self._starts.append(now)
             self._next_jittered_start = now + random.uniform(0.0, TITLE_DETAIL_START_JITTER_SECONDS)
 
-    def _reschedule(self, link: str, attempt: int, ready: float, *, pause: bool = False) -> None:
+    def _reschedule(
+        self,
+        link: str,
+        attempt: int,
+        ready: float,
+        *,
+        pause: bool = False,
+        reason: str = "retry",
+        log_retry: bool = True,
+    ) -> None:
         with self._condition:
             if pause:
                 self._paused_until = max(self._paused_until, ready)
-            remaining = ready - time.monotonic()
-            defer = not self._closed and remaining > self._max_pause_seconds
+            now = time.monotonic()
+            remaining = ready - now
+            defer = not self._closed and (
+                remaining > self._max_pause_seconds
+                or ready >= self._deadlines[link]
+            )
             if defer:
-                scope = "the title detail pool" if pause else f"title details for {link!r}"
                 logger.warning(
-                    "Deferring %s for this run because a %.1fs retry wait exceeds the budget",
-                    scope,
-                    remaining,
+                    "Deferring FlixPatrol title details for %s after %s: retry wait %.1fs, "
+                    "budget remaining %.1fs (budget %.0fs)%s",
+                    link,
+                    reason,
+                    max(0.0, remaining),
+                    max(0.0, self._deadlines[link] - now),
+                    self._max_pause_seconds,
+                    "; this also pauses the title detail pool" if pause else "",
                 )
                 if pause:
                     self._finish_pending()
             if not self._closed and not defer and attempt <= TITLE_DETAIL_RETRIES:
+                if log_retry:
+                    logger.debug(
+                        "Retrying FlixPatrol title details for %s after %s in %.1fs "
+                        "(retry %d of %d)",
+                        link,
+                        reason,
+                        max(0.0, remaining),
+                        attempt,
+                        TITLE_DETAIL_RETRIES,
+                    )
                 self._enqueue(link, attempt, ready)
             else:
+                if not self._closed and not defer:
+                    logger.warning(
+                        "Deferring FlixPatrol title details for %s after %s: exhausted %d retries",
+                        link,
+                        reason,
+                        TITLE_DETAIL_RETRIES,
+                    )
                 self._defer(link)
             self._condition.notify_all()
 
@@ -140,19 +188,35 @@ class TitleDetailPool:
             try:
                 response = self._fetch(link, self._reserve_start)
                 if response is not None and response.status_code in TITLE_DETAIL_RETRY_STATUSES:
-                    delay = retry_delay(response.headers.get("retry-after"), attempt, 2.0)
+                    retry_after = response.headers.get("retry-after")
+                    delay = retry_delay(retry_after, attempt, 2.0)
                     self._reschedule(
                         link, attempt + 1, time.monotonic() + delay,
                         pause=response.status_code == 429,
+                        reason=(
+                            f"HTTP {response.status_code}"
+                            + (f" (Retry-After: {retry_after})" if retry_after else "")
+                        ),
                     )
                 else:
                     details = self._parse(link, response) if response is not None else None
                     self._results[link].set_result(details)
             except DetailPoolPaused:
-                self._reschedule(link, attempt, 0.0)
-            except (RequestException, BrowserError):
+                self._reschedule(
+                    link,
+                    attempt,
+                    0.0,
+                    reason="request pacing",
+                    log_retry=False,
+                )
+            except (RequestException, BrowserError) as exc:
                 delay = retry_delay(None, attempt, 2.0)
-                self._reschedule(link, attempt + 1, time.monotonic() + delay)
+                self._reschedule(
+                    link,
+                    attempt + 1,
+                    time.monotonic() + delay,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
             except Exception as exc:
                 self._results[link].set_exception(exc)
 

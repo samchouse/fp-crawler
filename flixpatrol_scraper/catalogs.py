@@ -229,7 +229,6 @@ def _validate_replacement(
     source_complete: bool = False,
     max_titles_per_chart: int = TOP10_LIMIT,
     previous_title_limit: int = TOP10_LIMIT,
-    title_details_deferred: bool = False,
 ) -> None:
     published_date = chart_date(previous)
     observed = chart_date(replacement)
@@ -261,7 +260,7 @@ def _validate_replacement(
                 chart.get("title_count") == previous_title_limit
                 and updated["title_count"] < min(previous_title_limit, max_titles_per_chart)
             )
-            if not fewer_ranks and not title_details_deferred:
+            if not fewer_ranks:
                 continue
             try:
                 _validate_chart(
@@ -269,23 +268,10 @@ def _validate_replacement(
                 )
             except (KeyError, TypeError, ValueError, ScraperError):
                 continue
-            if fewer_ranks:
-                raise ScraperError(
-                    f"Source returned fewer ranks than the published chart {identifier!r} "
-                    "for the same date"
-                )
-            previous_matches = Counter(
-                entry["title"] for entry in chart["entries"] if entry["tmdb"] is not None
+            raise ScraperError(
+                f"Source returned fewer ranks than the published chart {identifier!r} "
+                "for the same date"
             )
-            updated_titles = Counter(entry["title"] for entry in updated["entries"])
-            updated_matches = Counter(
-                entry["title"] for entry in updated["entries"] if entry["tmdb"] is not None
-            )
-            if any(
-                updated_matches[title] < min(count, updated_titles[title])
-                for title, count in previous_matches.items()
-            ):
-                raise ScraperError(f"Deferred title details would remove TMDB matches from {identifier!r}")
 
 
 def publish_catalogs(
@@ -358,7 +344,6 @@ def publish_catalogs(
                         source_complete=saved.get("source_complete") is True,
                         max_titles_per_chart=saved.get("max_titles_per_chart", TOP10_LIMIT),
                         previous_title_limit=previous_limit,
-                        title_details_deferred=saved.get("title_details_deferred") is True,
                     )
                 except ScraperError as exc:
                     rejected[target] = published_date, str(exc)
@@ -425,7 +410,6 @@ def update_catalogs(
     candidate_title_repeats: dict[str, dict[str, list[list[int]]]] = {}
     accepted_checkpoints: dict[str, tuple[Path, dict]] = {}
     previous_catalogs: dict[str, tuple[dict, int]] = {}
-    fetch_title_details = bool(getattr(scraper, "fetch_title_details", False))
     max_titles_per_chart = getattr(scraper, "max_titles_per_chart", TOP10_LIMIT)
     regions: dict[str, dict] = {}
     pending = []
@@ -459,10 +443,7 @@ def update_catalogs(
         atomic_write_json(report_path, report)
 
     def matches_configuration(saved: dict) -> bool:
-        return (
-            saved.get("max_titles_per_chart", TOP10_LIMIT) == max_titles_per_chart
-            and (not fetch_title_details or saved.get("fetch_title_details") is True)
-        )
+        return saved.get("max_titles_per_chart", TOP10_LIMIT) == max_titles_per_chart
 
     for target in targets:
         previous_path = output_dir / f"{target}.json"
@@ -532,7 +513,6 @@ def update_catalogs(
                             source_complete=saved.get("source_complete") is True,
                             max_titles_per_chart=max_titles_per_chart,
                             previous_title_limit=previous_limit,
-                            title_details_deferred=saved.get("title_details_deferred") is True,
                         )
                 except ScraperError:
                     continue
@@ -585,7 +565,6 @@ def update_catalogs(
                         source_complete=result.source_complete,
                         max_titles_per_chart=result.max_titles_per_chart,
                         previous_title_limit=previous_limit,
-                        title_details_deferred=result.title_details_deferred,
                     )
                 saved = {
                     "version": CHECKPOINT_VERSION,
@@ -594,8 +573,6 @@ def update_catalogs(
                     "source_title_repeats": repeats,
                     "source_complete": result.source_complete,
                     "max_titles_per_chart": result.max_titles_per_chart,
-                    "title_details_deferred": result.title_details_deferred,
-                    "fetch_title_details": fetch_title_details and not result.title_details_deferred,
                 }
                 atomic_write_json(state_dir / "candidates" / f"{target}.json", saved)
                 candidates[target] = payload
